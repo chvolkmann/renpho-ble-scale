@@ -1,7 +1,7 @@
 import { createBluetooth, GattCharacteristic, GattServer } from "node-ble";
 import { Logger } from "tslog";
 
-import { buf2hex } from "./util";
+import { buf2hexstr } from "./util";
 
 const logger = new Logger({ name: 'gatt', displayFunctionName: false, displayFilePath: 'hidden' });
 
@@ -56,6 +56,6 @@ export const communicateWithGATT = async (deviceMac: string, onReady: (gatt: Gat
 }
 
 export const writeToUuid = async (label: string, char: GattCharacteristic, data: Buffer) => {
-  logger.getChildLogger({ name: `${label} 👉` }).debug(buf2hex(data))
+  logger.getChildLogger({ name: `${label} 👉` }).debug(buf2hexstr(data))
   await char.writeValue(data)
 }

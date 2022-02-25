@@ -1,4 +1,4 @@
-import { buf2hex, lpad } from "./util";
+import { buf2hexstr, lpad } from "./util";
 
 export interface BasePacket {
   packetId: number
@@ -9,18 +9,18 @@ export interface BasePacket {
   toString(): string
 }
 
-export type FirstPacket = BasePacket & {
+export interface FirstPacket extends BasePacket {
   packetId: 0x12
 
 }
-export type SecondPacket = BasePacket & {
+export interface SecondPacket extends BasePacket {
   packetId: 0x14
 }
 
-export type WeightDataPacket = BasePacket & {
+export interface WeightDataPacket extends BasePacket {
   packetId: 0x10
   scaleType: number
-  weight: number
+  weightValue: number
 }
 
 
@@ -36,17 +36,19 @@ export const packet2str = (packet: Packet): string => {
       case 'weight':
         return lpad(val.toFixed(2), 3 + 1 + 2)
       case 'checksum':
-        return lpad(val, 4)
+        return lpad(val, 3)
       case 'data':
-        return buf2hex(val)
+        return buf2hexstr(val)
       default:
         return val
     }
   }
 
   const kvs = Object.entries(packet).filter(([k]) => k !== 'data').map(([k, v]) => `${k}=${formatValue(k, v)}`)
+
   // data property last
   kvs.push(`data=${formatValue("data", packet.data)}`)
+
   return kvs.join(' ')
 }
 
@@ -62,7 +64,7 @@ export const parseIncomingPacket = (buf: Buffer): Packet => {
       return packet
     case 0x10:
       packet.scaleType = buf[2]
-      packet.weight = ((buf[3] << 8) + buf[4]) / 100
+      packet.weightValue = ((buf[3] << 8) + buf[4]) / 100
       return packet
     default:
       return packet
