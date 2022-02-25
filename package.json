@@ -1,0 +1,21 @@
+{
+  "name": "renpho-ble-scale",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "ts-node-dev src/index.ts"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^17.0.21",
+    "eslint": "^8.9.0",
+    "prettier": "^2.5.1",
+    "ts-node-dev": "^1.1.8"
+  },
+  "dependencies": {
+    "node-ble": "^1.7.0",
+    "tslog": "^3.3.2"
+  }
+}
