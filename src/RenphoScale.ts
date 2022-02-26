@@ -1,3 +1,4 @@
+import { connect } from "http2";
 import {
   Adapter, Bluetooth, createBluetooth, GattCharacteristic, GattServer
 } from "node-ble";
@@ -39,6 +40,7 @@ export class RenphoScale {
   protected verbose: boolean;
 
   timeout: boolean = false;
+  timeoutHandle?: any;
 
   public eventChar?: GattCharacteristic;
 
@@ -169,7 +171,7 @@ export class RenphoScale {
     const handleValueChange = (buf: Buffer) => {
       if (timeout) return;
       this.handlePacket(commandChar, parseIncomingPacket(buf)).catch((err) =>
-        this.logger.error(err)
+        this.logger.warn("Error while handling packet", err.toString())
       );
     };
     eventChar.on("valuechanged", handleValueChange);
@@ -177,7 +179,6 @@ export class RenphoScale {
     await eventChar.startNotifications();
     this.eventChar = eventChar;
 
-    let timerHandle: any;
     const onTimeout = () => {
       this.logger.warn(`timeout after (${TIMEOUT_AFTER}) seconds`);
       timeout = true;
@@ -190,14 +191,25 @@ export class RenphoScale {
       );
     };
     const resetTimer = () => {
-      if (timerHandle) clearTimeout(timerHandle);
-      timerHandle = setTimeout(onTimeout, TIMEOUT_AFTER * 1000);
+      if (this.timeoutHandle) {
+        clearTimeout(this.timeoutHandle);
+        this.timeoutHandle = undefined;
+      }
+      this.timeoutHandle = setTimeout(onTimeout, TIMEOUT_AFTER * 1000);
     };
     resetTimer();
 
     this.on("data", () => {
       resetTimer();
     });
+  }
+
+  async destroy() {
+    if (this.timeoutHandle) {
+      clearTimeout(this.timeoutHandle);
+      this.timeoutHandle = undefined;
+    }
+    await this.stopListening();
   }
 
   async stopListening() {
@@ -208,77 +220,77 @@ export class RenphoScale {
     this.eventChar = undefined;
   }
 
-  async takeMeasurement() {
-    return await new Promise<number>(async (resolve) => {
-      this.logger.info("Starting measurement...");
+  // async takeMeasurement() {
+  //   return await new Promise<number>(async (resolve) => {
+  //     this.logger.info("Starting measurement...");
 
-      const svc = await this.gatt.getPrimaryService(makeLongUuid("ffe0"));
-      const eventChar = await svc.getCharacteristic(makeLongUuid("ffe1"));
-      const commandChar = await svc.getCharacteristic(makeLongUuid("ffe3"));
+  //     const svc = await this.gatt.getPrimaryService(makeLongUuid("ffe0"));
+  //     const eventChar = await svc.getCharacteristic(makeLongUuid("ffe1"));
+  //     const commandChar = await svc.getCharacteristic(makeLongUuid("ffe3"));
 
-      const sendCommand = async (buf: Buffer) => {
-        if (this.verbose)
-          this.logger
-            .getChildLogger({
-              name: "SEND 👉",
-            })
-            .debug(buf2hexstr(buf));
-        await commandChar.writeValue(buf);
-      };
+  //     const sendCommand = async (buf: Buffer) => {
+  //       if (this.verbose)
+  //         this.logger
+  //           .getChildLogger({
+  //             name: "SEND 👉",
+  //           })
+  //           .debug(buf2hexstr(buf));
+  //       await commandChar.writeValue(buf);
+  //     };
 
-      const handlePacket = async (p: Packet) => {
-        if (this.verbose)
-          this.logger
-            .getChildLogger({
-              name: "RECV 📨",
-            })
-            .debug(buf2hexstr(p.data));
+  //     const handlePacket = async (p: Packet) => {
+  //       if (this.verbose)
+  //         this.logger
+  //           .getChildLogger({
+  //             name: "RECV 📨",
+  //           })
+  //           .debug(buf2hexstr(p.data));
 
-        switch (p.packetId) {
-          case 0x12:
-            this.logger.debug(`✅ Received handshake packet 1/2`);
-            // ????
-            const magicBytesForFirstPacket = [
-              0x13, 0x09, 0x15, 0x01, 0x10, 0x00, 0x00, 0x00, 0x42,
-            ];
-            await sendCommand(Buffer.from(magicBytesForFirstPacket));
-            return;
-          case 0x14:
-            this.logger.debug(`✅ Received handshake packet 2/2`);
-            // turn on bluetooth indicator?
-            const magicBytesForSecondPacket = [
-              0x20, 0x08, 0x15, 0x09, 0x0b, 0xac, 0x29, 0x26,
-            ];
-            await sendCommand(Buffer.from(magicBytesForSecondPacket));
-            return;
-          case 0x10:
-            const flag = p.data[5];
-            if (flag === 0) {
-              this.emit("liveupdate", p.weightValue);
-            } else if (flag === 1) {
-              this.logger.debug(`✅ Received completed measurement packet`);
-              // send stop packet
-              await sendCommand(Buffer.from([0x1f, 0x05, 0x15, 0x10, 0x49]));
+  //       switch (p.packetId) {
+  //         case 0x12:
+  //           this.logger.debug(`✅ Received handshake packet 1/2`);
+  //           // ????
+  //           const magicBytesForFirstPacket = [
+  //             0x13, 0x09, 0x15, 0x01, 0x10, 0x00, 0x00, 0x00, 0x42,
+  //           ];
+  //           await sendCommand(Buffer.from(magicBytesForFirstPacket));
+  //           return;
+  //         case 0x14:
+  //           this.logger.debug(`✅ Received handshake packet 2/2`);
+  //           // turn on bluetooth indicator?
+  //           const magicBytesForSecondPacket = [
+  //             0x20, 0x08, 0x15, 0x09, 0x0b, 0xac, 0x29, 0x26,
+  //           ];
+  //           await sendCommand(Buffer.from(magicBytesForSecondPacket));
+  //           return;
+  //         case 0x10:
+  //           const flag = p.data[5];
+  //           if (flag === 0) {
+  //             this.emit("liveupdate", p.weightValue);
+  //           } else if (flag === 1) {
+  //             this.logger.debug(`✅ Received completed measurement packet`);
+  //             // send stop packet
+  //             await sendCommand(Buffer.from([0x1f, 0x05, 0x15, 0x10, 0x49]));
 
-              await eventChar.stopNotifications();
-              this.emit("measurement", p.weightValue);
-              resolve(p.weightValue);
-            }
-            return;
-          default:
-            return;
-        }
-      };
+  //             await eventChar.stopNotifications();
+  //             this.emit("measurement", p.weightValue);
+  //             resolve(p.weightValue);
+  //           }
+  //           return;
+  //         default:
+  //           return;
+  //       }
+  //     };
 
-      eventChar.on("valuechanged", (buf) => {
-        handlePacket(parseIncomingPacket(buf)).catch((err) =>
-          this.logger.error(err)
-        );
-      });
+  //     eventChar.on("valuechanged", (buf) => {
+  //       handlePacket(parseIncomingPacket(buf)).catch((err) =>
+  //         this.logger.error("Error while handling packet", err)
+  //       );
+  //     });
 
-      await eventChar.startNotifications();
-    });
-  }
+  //     await eventChar.startNotifications();
+  //   });
+  // }
 }
 
 (async (once?: boolean) => {
@@ -288,6 +300,9 @@ export class RenphoScale {
     displayFilePath: "hidden",
   });
   const { bluetooth, destroy } = createBluetooth();
+
+  let destroyScale: any = undefined;
+
   try {
     const adapter = await bluetooth.defaultAdapter();
 
@@ -315,15 +330,25 @@ export class RenphoScale {
         });
 
       await scale.startListening();
-      await new Promise<void>((resolve, reject) => {
+
+      // this resolves as soon as raiseFlag() is called
+      await new Promise<void>((resolve) => {
         raiseFlag = resolve;
       });
+
+      return () => {
+        scale
+          .destroy()
+          .catch((err) =>
+            logger.warn("Couldnt stop listening", err.toString())
+          );
+      };
     };
 
     // TODO DBusError: Operation already in progress can spam the console
     while (true) {
       try {
-        await connectAndHandle();
+        destroyScale = await connectAndHandle();
         if (once) break;
       } catch (err: any) {
         logger.error(err.toString());
@@ -335,6 +360,7 @@ export class RenphoScale {
     logger.info("Done!");
   } finally {
     logger.info("Properly destroying bluetooth connection");
+    if (destroyScale) destroyScale();
     destroy();
   }
-})(false);
+})(true);
