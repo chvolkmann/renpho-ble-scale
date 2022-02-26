@@ -1,3 +1,5 @@
+/* currently not used */
+
 import { createBluetooth, GattCharacteristic, GattServer } from "node-ble";
 import { Logger } from "tslog";
 

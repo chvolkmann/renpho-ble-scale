@@ -1,8 +1,9 @@
 import {
   Adapter, createBluetooth, GattCharacteristic, GattServer
 } from "node-ble";
-import { Logger, LoggerWithoutCallSite } from "tslog";
+import { TLogLevelName } from "tslog";
 
+import { getLogger } from "./logging";
 import { Packet, parseIncomingPacket } from "./protocol";
 import { buf2hexstr, delay, makeLongUuid } from "./util";
 
@@ -26,26 +27,27 @@ export interface EventTree {
 
 export type EventName = keyof EventTree;
 
+export interface RenphoScaleConstructorOpts {
+  loglevel?: TLogLevelName;
+}
+
 /**
- * Instance for communicating with the Renpho Scale.
+ * Instance for communicating with a Renpho person scale.
+ *
+ * *Events:*
+ * - `data`: emitted for each incoming packet
+ * - `liveupdate`: emitted while a person is standing on the scale.
+ * - `measurement`: emitted after the scale has settled towards a weight
+ * - `timeout`: emitted after no packets have been received for 10 seconds by default
  */
 export class RenphoScale {
-  protected readonly logger = new Logger({
-    name: RenphoScale.name,
-    displayFunctionName: false,
-    displayFilePath: "hidden",
-  });
+  protected readonly logger = getLogger(RenphoScale.name);
   protected listeners: Record<EventName, Array<(...args: any[]) => unknown>> = {
     liveupdate: [],
     measurement: [],
     data: [],
     timeout: [],
   };
-
-  /**
-   * Whether to log a lot or not
-   */
-  protected verbose: boolean;
 
   /**
    * Has a timer ID as value if clock is ticking
@@ -58,49 +60,42 @@ export class RenphoScale {
   public eventChar?: GattCharacteristic;
 
   /**
-   * Factory function for connecting to a scale.
+   * Factory function for connecting to a Renpho scale.
    *
    * @param btAdapter node-ble bluetooth adapter isntance
    * @param macAddress address of the BLE scale to be connected to
    * @param opts optional configuration
-   * @returns an instance to communicate with
+   * @returns connected instance to communicate with
    */
   static async connect(
     btAdapter: Adapter,
     macAddress: string,
-    opts: { verbose?: boolean } = {}
+    opts: RenphoScaleConstructorOpts = {}
   ) {
-    const logger = new LoggerWithoutCallSite({
-      name: "connect()",
-      displayFunctionName: false,
-      displayFilePath: "hidden",
-    });
-    if (opts.verbose) logger.info(`Waiting for connection to ${macAddress}`);
+    const logger = getLogger("connect()", { minLevel: "info" });
+    logger.info(`Waiting for connection to ${macAddress}`);
     const device = await btAdapter.waitDevice(macAddress);
     await device.connect();
-    if (opts.verbose) logger.info(`Connected!`);
+    logger.info(`Connected!`);
     //  TODO we can get stuck here!, need another timeout
     const gatt = await device.gatt();
     return new RenphoScale(gatt, opts);
   }
 
   /**
-   *
    * @param gatt node-ble GATT server to infer services and characteristics from.
    * @param opts optional configuration
    */
-  constructor(public gatt: GattServer, opts: { verbose?: boolean } = {}) {
-    this.verbose = opts?.verbose ?? false;
-  }
+  constructor(public gatt: GattServer, opts: RenphoScaleConstructorOpts = {}) {}
 
-  /**
-   * Translates the magic number representing a scale type (lbs, kgs, ...) into a string
-   */
-  protected static getScaleType(magicNumber: number): string {
-    // TODO fill this
-    const SCALE_TYPES: Record<number, string> = { 21: "kg" };
-    return SCALE_TYPES[magicNumber] ?? "unknown";
-  }
+  // /**
+  //  * Translates the magic number representing a scale type (lbs, kgs, ...) into a string
+  //  */
+  // protected static getScaleType(magicNumber: number): string {
+  //   // TODO fill this
+  //   const SCALE_TYPES: Record<number, string> = { 21: "kg" };
+  //   return SCALE_TYPES[magicNumber] ?? "unknown";
+  // }
 
   /**
    * The list of listeners registered for an event
@@ -166,12 +161,11 @@ export class RenphoScale {
    * Sends a command packet to the characterstic.
    */
   protected async sendCommand(char: GattCharacteristic, buf: Buffer) {
-    if (this.verbose)
-      this.logger
-        .getChildLogger({
-          name: "SEND 👉",
-        })
-        .silly(buf2hexstr(buf));
+    this.logger
+      .getChildLogger({
+        name: "SEND 👉",
+      })
+      .silly(buf2hexstr(buf));
     await char.writeValue(buf);
   }
 
@@ -179,18 +173,17 @@ export class RenphoScale {
    * Processes an incoming packet and causes events to be fired.
    */
   protected async handlePacket(outChar: GattCharacteristic, p: Packet) {
-    if (this.verbose)
-      this.logger
-        .getChildLogger({
-          name: "RECV 📨",
-        })
-        .silly(buf2hexstr(p.data));
+    this.logger
+      .getChildLogger({
+        name: "RECV 📨",
+      })
+      .silly(buf2hexstr(p.data));
 
     this.emit("data", p);
 
     switch (p.packetId) {
       case 0x12:
-        if (this.verbose) this.logger.debug(`✅ Received handshake packet 1/2`);
+        this.logger.debug(`✅ Received handshake packet 1/2`);
         // ????
         const magicBytesForFirstPacket = [
           0x13, 0x09, 0x15, 0x01, 0x10, 0x00, 0x00, 0x00, 0x42,
@@ -198,7 +191,7 @@ export class RenphoScale {
         await this.sendCommand(outChar, Buffer.from(magicBytesForFirstPacket));
         return;
       case 0x14:
-        if (this.verbose) this.logger.debug(`✅ Received handshake packet 2/2`);
+        this.logger.debug(`✅ Received handshake packet 2/2`);
         // turn on bluetooth indicator?
         const magicBytesForSecondPacket = [
           0x20, 0x08, 0x15, 0x09, 0x0b, 0xac, 0x29, 0x26,
@@ -210,8 +203,7 @@ export class RenphoScale {
         if (flag === 0) {
           this.emit("liveupdate", p.weightValue);
         } else if (flag === 1) {
-          if (this.verbose)
-            this.logger.debug(`✅ Received completed measurement packet`);
+          this.logger.debug(`✅ Received completed measurement packet`);
           // send stop packet
           await this.sendCommand(
             outChar,
@@ -233,7 +225,9 @@ export class RenphoScale {
   async startListening(timeoutSecs = 10) {
     if (this.eventChar) return;
 
-    this.logger.info(`Listening... (timeout after ${timeoutSecs} seconds}`);
+    this.logger.info(
+      `Listening for data packets... (timeout after ${timeoutSecs} seconds}`
+    );
 
     const svc = await this.gatt.getPrimaryService(makeLongUuid("ffe0"));
     const eventChar = await svc.getCharacteristic(makeLongUuid("ffe1"));
@@ -301,16 +295,23 @@ export class RenphoScale {
   }
 }
 
+/**
+ * Waits for the renpho scale to be turned on and calls onConnect() afterwards.
+ * You will want to subscribe to events of the scale argument the function will be called with.
+ * @param mac A MAC address for the Bluetooth Low Energy device.
+ * @param opts.onConnect Callback that will be invoked with a RenphoScale instance.
+ * @param levelevel `tslog` log level. To get everything use `trace`
+ * @param opts.once If true, the loop exits after the first iteration.
+ */
 export const runMessageLoop = async (
   mac: string,
-  once?: boolean,
-  onConnect?: (scale: RenphoScale) => unknown
+  opts: {
+    onConnect?: (scale: RenphoScale) => unknown;
+    once?: boolean;
+    loglevel?: TLogLevelName;
+  } = {}
 ) => {
-  const logger = new Logger({
-    name: "main()",
-    displayFunctionName: false,
-    displayFilePath: "hidden",
-  });
+  const logger = getLogger("runMessageLoop()");
 
   const { bluetooth, destroy: destroyBluetooth } = createBluetooth();
   let destroyScaleSession: ((...args: any[]) => unknown) | undefined =
@@ -320,9 +321,7 @@ export const runMessageLoop = async (
     const adapter = await bluetooth.defaultAdapter();
 
     const connectAndHandle = async () => {
-      const scale = await RenphoScale.connect(adapter, mac, {
-        verbose: false,
-      });
+      const scale = await RenphoScale.connect(adapter, mac, opts);
       let raiseFlag: () => unknown;
       scale
         .on("timeout", () => {
@@ -332,7 +331,7 @@ export const runMessageLoop = async (
           if (raiseFlag) raiseFlag();
         });
 
-      onConnect?.(scale);
+      opts.onConnect?.(scale);
 
       await scale.startListening(10);
 
@@ -351,15 +350,15 @@ export const runMessageLoop = async (
     while (true) {
       try {
         destroyScaleSession = await connectAndHandle();
-        if (once) break;
+        if (opts.once) break;
       } catch (err: any) {
         logger.warn(err.toString());
       }
-      logger.info("Next iteration!");
+      logger.debug("Next iteration!");
       await delay(1);
     }
 
-    // if we get to here, `once` is set and we're done
+    // <-- if we get to here, `once` is set and we're done
   } finally {
     logger.info("Destroying bluetooth connection");
     if (destroyScaleSession) destroyScaleSession();
