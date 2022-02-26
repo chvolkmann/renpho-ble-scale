@@ -1,10 +1,8 @@
-import { connect } from "http2";
 import {
-  Adapter, Bluetooth, createBluetooth, GattCharacteristic, GattServer
+  Adapter, createBluetooth, GattCharacteristic, GattServer
 } from "node-ble";
 import { Logger, LoggerWithoutCallSite } from "tslog";
 
-import { communicateWithGATT, writeToUuid } from "./gatt";
 import { Packet, parseIncomingPacket } from "./protocol";
 import { buf2hexstr, delay, makeLongUuid } from "./util";
 
@@ -12,9 +10,13 @@ export interface EventEmitter {
   emit(eventName: string, ...args: any[]): unknown;
 
   on(eventName: string, handler: (...args: any[]) => unknown): this;
+  once(eventName: string, handler: (...args: any[]) => unknown): this;
   off(eventName: string, handler: (...args: any[]) => unknown): this;
 }
 
+/**
+ * Events and corresponding payload arguments
+ */
 export interface EventTree {
   data: [packet: Packet];
   liveupdate: [weightValue: number];
@@ -24,26 +26,45 @@ export interface EventTree {
 
 export type EventName = keyof EventTree;
 
+/**
+ * Instance for communicating with the Renpho Scale.
+ */
 export class RenphoScale {
+  protected readonly logger = new Logger({
+    name: RenphoScale.name,
+    displayFunctionName: false,
+    displayFilePath: "hidden",
+  });
   protected listeners: Record<EventName, Array<(...args: any[]) => unknown>> = {
     liveupdate: [],
     measurement: [],
     data: [],
     timeout: [],
   };
-  protected readonly logger = new Logger({
-    name: RenphoScale.name,
-    displayFunctionName: false,
-    displayFilePath: "hidden",
-  });
 
+  /**
+   * Whether to log a lot or not
+   */
   protected verbose: boolean;
 
-  timeout: boolean = false;
+  /**
+   * Has a timer ID as value if clock is ticking
+   */
   timeoutHandle?: any;
 
+  /**
+   * The GATT characterstic (= communication channel) for sending commands.
+   */
   public eventChar?: GattCharacteristic;
 
+  /**
+   * Factory function for connecting to a scale.
+   *
+   * @param btAdapter node-ble bluetooth adapter isntance
+   * @param macAddress address of the BLE scale to be connected to
+   * @param opts optional configuration
+   * @returns an instance to communicate with
+   */
   static async connect(
     btAdapter: Adapter,
     macAddress: string,
@@ -54,8 +75,7 @@ export class RenphoScale {
       displayFunctionName: false,
       displayFilePath: "hidden",
     });
-    if (opts.verbose)
-      if (opts.verbose) logger.info(`Waiting for connection to ${macAddress}`);
+    if (opts.verbose) logger.info(`Waiting for connection to ${macAddress}`);
     const device = await btAdapter.waitDevice(macAddress);
     await device.connect();
     if (opts.verbose) logger.info(`Connected!`);
@@ -64,32 +84,73 @@ export class RenphoScale {
     return new RenphoScale(gatt, opts);
   }
 
+  /**
+   *
+   * @param gatt node-ble GATT server to infer services and characteristics from.
+   * @param opts optional configuration
+   */
   constructor(public gatt: GattServer, opts: { verbose?: boolean } = {}) {
     this.verbose = opts?.verbose ?? false;
   }
 
-  protected static getScaleType(magicNumber: number) {
+  /**
+   * Translates the magic number representing a scale type (lbs, kgs, ...) into a string
+   */
+  protected static getScaleType(magicNumber: number): string {
     // TODO fill this
     const SCALE_TYPES: Record<number, string> = { 21: "kg" };
     return SCALE_TYPES[magicNumber] ?? "unknown";
   }
 
-  private getListeners(eventName: string) {
-    if (!["liveupdate", "measurement", "data", "timeout"].includes(eventName))
+  /**
+   * The list of listeners registered for an event
+   */
+  protected getListeners(eventName: string) {
+    const REGISTERED_LISTENERS = [
+      "liveupdate",
+      "measurement",
+      "data",
+      "timeout",
+    ];
+    if (!REGISTERED_LISTENERS.includes(eventName))
       throw new Error(`Invalid event: ${eventName}`);
     return this.listeners[eventName as EventName];
   }
 
+  /**
+   *
+   * Emits an event with the given payload.
+   */
   protected emit(eventName: EventName, ...args: any[]): this {
     this.getListeners(eventName).forEach((fn: any) => fn(...args));
     return this;
   }
 
+  /**
+   * Registers an event listener.
+   */
   on(eventName: EventName, handler?: (...args: any[]) => unknown): this {
     if (handler) this.getListeners(eventName).push(handler);
     return this;
   }
 
+  /**
+   * Registers an event listener to be run only once.
+   */
+  once(eventName: EventName, handler?: (...args: any[]) => unknown): this {
+    if (!handler) return this;
+
+    const wrappedHandler = (...args: any[]) => {
+      this.off(eventName, wrappedHandler);
+      return handler(...args);
+    };
+    this.on(eventName, wrappedHandler);
+    return this;
+  }
+
+  /**
+   * De-registers an event listener if supplied or all listeners for the event otherwise.
+   */
   off(eventName: EventName, handler?: (...args: any[]) => unknown): this {
     const listeners = this.getListeners(eventName);
     if (handler) {
@@ -101,29 +162,35 @@ export class RenphoScale {
     return this;
   }
 
+  /**
+   * Sends a command packet to the characterstic.
+   */
   protected async sendCommand(char: GattCharacteristic, buf: Buffer) {
     if (this.verbose)
       this.logger
         .getChildLogger({
           name: "SEND 👉",
         })
-        .debug(buf2hexstr(buf));
+        .silly(buf2hexstr(buf));
     await char.writeValue(buf);
   }
 
+  /**
+   * Processes an incoming packet and causes events to be fired.
+   */
   protected async handlePacket(outChar: GattCharacteristic, p: Packet) {
     if (this.verbose)
       this.logger
         .getChildLogger({
           name: "RECV 📨",
         })
-        .debug(buf2hexstr(p.data));
+        .silly(buf2hexstr(p.data));
 
     this.emit("data", p);
 
     switch (p.packetId) {
       case 0x12:
-        this.logger.debug(`✅ Received handshake packet 1/2`);
+        if (this.verbose) this.logger.debug(`✅ Received handshake packet 1/2`);
         // ????
         const magicBytesForFirstPacket = [
           0x13, 0x09, 0x15, 0x01, 0x10, 0x00, 0x00, 0x00, 0x42,
@@ -131,7 +198,7 @@ export class RenphoScale {
         await this.sendCommand(outChar, Buffer.from(magicBytesForFirstPacket));
         return;
       case 0x14:
-        this.logger.debug(`✅ Received handshake packet 2/2`);
+        if (this.verbose) this.logger.debug(`✅ Received handshake packet 2/2`);
         // turn on bluetooth indicator?
         const magicBytesForSecondPacket = [
           0x20, 0x08, 0x15, 0x09, 0x0b, 0xac, 0x29, 0x26,
@@ -143,7 +210,8 @@ export class RenphoScale {
         if (flag === 0) {
           this.emit("liveupdate", p.weightValue);
         } else if (flag === 1) {
-          this.logger.debug(`✅ Received completed measurement packet`);
+          if (this.verbose)
+            this.logger.debug(`✅ Received completed measurement packet`);
           // send stop packet
           await this.sendCommand(
             outChar,
@@ -153,50 +221,51 @@ export class RenphoScale {
         }
         return;
       default:
-        this.logger.silly("Unknown packet", p);
+        this.logger.warn("Unknown packet", p);
     }
   }
 
-  async startListening() {
+  /**
+   * Starts the BLE listening process and an accompanying timeout.
+   *
+   * The `timeout` event will be fired after no message was received for `timeoutSecs` seconds.
+   */
+  async startListening(timeoutSecs = 10) {
     if (this.eventChar) return;
-    const TIMEOUT_AFTER = 10;
 
-    this.logger.info(`Listening... (timeout after ${TIMEOUT_AFTER} seconds}`);
+    this.logger.info(`Listening... (timeout after ${timeoutSecs} seconds}`);
 
     const svc = await this.gatt.getPrimaryService(makeLongUuid("ffe0"));
     const eventChar = await svc.getCharacteristic(makeLongUuid("ffe1"));
     const commandChar = await svc.getCharacteristic(makeLongUuid("ffe3"));
 
-    let timeout = false;
+    let didTimeout = false;
     const handleValueChange = (buf: Buffer) => {
-      if (timeout) return;
+      if (didTimeout) return;
       this.handlePacket(commandChar, parseIncomingPacket(buf)).catch((err) =>
         this.logger.warn("Error while handling packet", err.toString())
       );
     };
-    eventChar.on("valuechanged", handleValueChange);
 
-    await eventChar.startNotifications();
-    this.eventChar = eventChar;
-
-    const onTimeout = () => {
-      this.logger.warn(`timeout after (${TIMEOUT_AFTER}) seconds`);
-      timeout = true;
+    const handleTimeout = () => {
+      this.logger.warn(`timeout after (${timeoutSecs}) seconds`);
+      didTimeout = true;
       this.emit("timeout");
       eventChar.off("valuechanged", handleValueChange);
-      this.stopListening().catch((err) =>
-        this.logger.debug(
-          `stopListening failed, but thats fine (${err.toString()})}`
-        )
-      );
+      this.destroy();
     };
     const resetTimer = () => {
       if (this.timeoutHandle) {
         clearTimeout(this.timeoutHandle);
         this.timeoutHandle = undefined;
       }
-      this.timeoutHandle = setTimeout(onTimeout, TIMEOUT_AFTER * 1000);
+      this.timeoutHandle = setTimeout(handleTimeout, timeoutSecs * 1000);
     };
+
+    eventChar.on("valuechanged", handleValueChange);
+
+    await eventChar.startNotifications();
+    this.eventChar = eventChar;
     resetTimer();
 
     this.on("data", () => {
@@ -204,124 +273,58 @@ export class RenphoScale {
     });
   }
 
+  /**
+   * Stops listening and clears resources.
+   */
   async destroy() {
-    if (this.timeoutHandle) {
-      clearTimeout(this.timeoutHandle);
-      this.timeoutHandle = undefined;
+    try {
+      if (this.timeoutHandle) {
+        clearTimeout(this.timeoutHandle);
+        this.timeoutHandle = undefined;
+      }
+      await this.stopListening();
+    } catch (err: any) {
+      this.logger.debug(
+        `Error during destroy(), but that's fine (${err.toString()})}`
+      );
     }
-    await this.stopListening();
   }
 
-  async stopListening() {
+  /**
+   * Stops listenining for BLE notifications.
+   */
+  protected async stopListening() {
     if (!this.eventChar) return;
 
-    this.logger.info("Stopping...");
     await this.eventChar.stopNotifications();
     this.eventChar = undefined;
   }
-
-  // async takeMeasurement() {
-  //   return await new Promise<number>(async (resolve) => {
-  //     this.logger.info("Starting measurement...");
-
-  //     const svc = await this.gatt.getPrimaryService(makeLongUuid("ffe0"));
-  //     const eventChar = await svc.getCharacteristic(makeLongUuid("ffe1"));
-  //     const commandChar = await svc.getCharacteristic(makeLongUuid("ffe3"));
-
-  //     const sendCommand = async (buf: Buffer) => {
-  //       if (this.verbose)
-  //         this.logger
-  //           .getChildLogger({
-  //             name: "SEND 👉",
-  //           })
-  //           .debug(buf2hexstr(buf));
-  //       await commandChar.writeValue(buf);
-  //     };
-
-  //     const handlePacket = async (p: Packet) => {
-  //       if (this.verbose)
-  //         this.logger
-  //           .getChildLogger({
-  //             name: "RECV 📨",
-  //           })
-  //           .debug(buf2hexstr(p.data));
-
-  //       switch (p.packetId) {
-  //         case 0x12:
-  //           this.logger.debug(`✅ Received handshake packet 1/2`);
-  //           // ????
-  //           const magicBytesForFirstPacket = [
-  //             0x13, 0x09, 0x15, 0x01, 0x10, 0x00, 0x00, 0x00, 0x42,
-  //           ];
-  //           await sendCommand(Buffer.from(magicBytesForFirstPacket));
-  //           return;
-  //         case 0x14:
-  //           this.logger.debug(`✅ Received handshake packet 2/2`);
-  //           // turn on bluetooth indicator?
-  //           const magicBytesForSecondPacket = [
-  //             0x20, 0x08, 0x15, 0x09, 0x0b, 0xac, 0x29, 0x26,
-  //           ];
-  //           await sendCommand(Buffer.from(magicBytesForSecondPacket));
-  //           return;
-  //         case 0x10:
-  //           const flag = p.data[5];
-  //           if (flag === 0) {
-  //             this.emit("liveupdate", p.weightValue);
-  //           } else if (flag === 1) {
-  //             this.logger.debug(`✅ Received completed measurement packet`);
-  //             // send stop packet
-  //             await sendCommand(Buffer.from([0x1f, 0x05, 0x15, 0x10, 0x49]));
-
-  //             await eventChar.stopNotifications();
-  //             this.emit("measurement", p.weightValue);
-  //             resolve(p.weightValue);
-  //           }
-  //           return;
-  //         default:
-  //           return;
-  //       }
-  //     };
-
-  //     eventChar.on("valuechanged", (buf) => {
-  //       handlePacket(parseIncomingPacket(buf)).catch((err) =>
-  //         this.logger.error("Error while handling packet", err)
-  //       );
-  //     });
-
-  //     await eventChar.startNotifications();
-  //   });
-  // }
 }
 
-(async (once?: boolean) => {
+export const runMessageLoop = async (
+  mac: string,
+  once?: boolean,
+  onConnect?: (scale: RenphoScale) => unknown
+) => {
   const logger = new Logger({
     name: "main()",
     displayFunctionName: false,
     displayFilePath: "hidden",
   });
-  const { bluetooth, destroy } = createBluetooth();
 
-  let destroyScale: any = undefined;
+  const { bluetooth, destroy: destroyBluetooth } = createBluetooth();
+  let destroyScaleSession: ((...args: any[]) => unknown) | undefined =
+    undefined;
 
   try {
     const adapter = await bluetooth.defaultAdapter();
 
     const connectAndHandle = async () => {
-      const scale = await RenphoScale.connect(adapter, "A4:C1:38:D9:67:6A", {
-        verbose: true,
+      const scale = await RenphoScale.connect(adapter, mac, {
+        verbose: false,
       });
       let raiseFlag: () => unknown;
       scale
-        .on("measurement", (val) =>
-          logger
-            .getChildLogger({ name: "event:measurement" })
-            .silly(`${val.toFixed(2)}kg`)
-        )
-        .on("liveupdate", (val) =>
-          logger
-            .getChildLogger({ name: "event:liveupdate" })
-            .silly(`${val.toFixed(2)}kg`)
-        )
         .on("timeout", () => {
           if (raiseFlag) raiseFlag();
         })
@@ -329,38 +332,37 @@ export class RenphoScale {
           if (raiseFlag) raiseFlag();
         });
 
-      await scale.startListening();
+      onConnect?.(scale);
+
+      await scale.startListening(10);
 
       // this resolves as soon as raiseFlag() is called
       await new Promise<void>((resolve) => {
         raiseFlag = resolve;
       });
 
+      // destructor to be called from somewhere else
       return () => {
-        scale
-          .destroy()
-          .catch((err) =>
-            logger.warn("Couldnt stop listening", err.toString())
-          );
+        scale.destroy();
       };
     };
 
     // TODO DBusError: Operation already in progress can spam the console
     while (true) {
       try {
-        destroyScale = await connectAndHandle();
+        destroyScaleSession = await connectAndHandle();
         if (once) break;
       } catch (err: any) {
-        logger.error(err.toString());
+        logger.warn(err.toString());
       }
       logger.info("Next iteration!");
       await delay(1);
     }
 
-    logger.info("Done!");
+    // if we get to here, `once` is set and we're done
   } finally {
-    logger.info("Properly destroying bluetooth connection");
-    if (destroyScale) destroyScale();
-    destroy();
+    logger.info("Destroying bluetooth connection");
+    if (destroyScaleSession) destroyScaleSession();
+    destroyBluetooth();
   }
-})(true);
+};
